@@ -97,17 +97,6 @@ func ensureLoadBalancerUUID(lb *nbdb.LoadBalancer) {
 }
 
 func createLoadBalancerOps(nbClient libovsdbclient.Client, ops []libovsdb.Operation, lb *nbdb.LoadBalancer) ([]libovsdb.Operation, error) {
-	timeout := types.OVSDBWaitTimeout
-	ops = append(ops, libovsdb.Operation{
-		Op:      libovsdb.OperationWait,
-		Timeout: &timeout,
-		Table:   "Load_Balancer",
-		Where:   []libovsdb.Condition{{Column: "name", Function: libovsdb.ConditionEqual, Value: lb.Name}},
-		Columns: []string{"name"},
-		Until:   "!=",
-		Rows:    []libovsdb.Row{{"name": lb.Name}},
-	})
-
 	ensureLoadBalancerUUID(lb)
 	op, err := nbClient.Create(lb)
 	if err != nil {
