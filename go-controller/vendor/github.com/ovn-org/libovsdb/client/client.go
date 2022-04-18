@@ -316,7 +316,7 @@ func (o *ovsdbClient) connect(ctx context.Context, reconnect bool) error {
 // tryEndpoint connects to a single database endpoint. Returns the
 // server ID (if clustered) on success, or an error.
 func (o *ovsdbClient) tryEndpoint(ctx context.Context, u *url.URL) (string, error) {
-	o.logger.V(5).Info("trying to connect", "endpoint", fmt.Sprintf("%v", u))
+	o.logger.V(4).Info("trying to connect", "endpoint", fmt.Sprintf("%v", u))
 	var dialer net.Dialer
 	var err error
 	var c net.Conn
@@ -752,11 +752,12 @@ func (o *ovsdbClient) Transact(ctx context.Context, operation ...ovsdb.Operation
 // Transact performs the provided Operations on the database
 // RFC 7047 : transact
 func (o *ovsdbClient) TransactTime(ctx context.Context, operation ...ovsdb.Operation) ([]ovsdb.OperationResult, error, time.Duration) {
+	rpcMutexTime := time.Now()
 	o.rpcMutex.RLock()
 	if o.rpcClient == nil || !o.connected {
 		o.rpcMutex.RUnlock()
 		if o.options.reconnect {
-			o.logger.V(5).Info("blocking transaction until reconnected", "operations",
+			o.logger.V(4).Info("blocking transaction until reconnected", "operations",
 				fmt.Sprintf("%+v", operation))
 			ticker := time.NewTicker(50 * time.Millisecond)
 			defer ticker.Stop()
@@ -778,6 +779,7 @@ func (o *ovsdbClient) TransactTime(ctx context.Context, operation ...ovsdb.Opera
 		}
 	}
 	defer o.rpcMutex.RUnlock()
+	o.logger.V(4).Infof("Finished rpcMutexTime: %v", time.Since(rpcMutexTime))
 	res, err, rpcTime := o.transactTime(ctx, o.primaryDBName, operation...)
 	return res, err, rpcTime
 }
@@ -790,9 +792,11 @@ func (o *ovsdbClient) transact(ctx context.Context, dbName string, operation ...
 func (o *ovsdbClient) transactTime(ctx context.Context, dbName string, operation ...ovsdb.Operation) ([]ovsdb.OperationResult, error, time.Duration) {
 	var reply []ovsdb.OperationResult
 	db := o.databases[dbName]
+	modelMutexTime := time.Now()
 	db.modelMutex.RLock()
 	schema := o.databases[dbName].model.Schema
 	db.modelMutex.RUnlock()
+	o.logger.V(4).Infof("Finished modelMutexTime: %v", time.Since(modelMutexTime))
 
 	if reflect.DeepEqual(schema, ovsdb.DatabaseSchema{}) {
 		return nil, fmt.Errorf("cannot transact to database %s: schema unknown", dbName), 0
