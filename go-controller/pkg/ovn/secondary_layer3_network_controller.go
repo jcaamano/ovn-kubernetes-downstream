@@ -320,29 +320,8 @@ func NewSecondaryLayer3NetworkController(
 
 	stopChan := make(chan struct{})
 	ipv4Mode, ipv6Mode := netInfo.IPMode()
-	var zoneICHandler *zoneic.ZoneInterconnectHandler
-	if config.OVNKubernetesFeature.EnableInterconnect {
-		zoneICHandler = zoneic.NewZoneInterconnectHandler(netInfo, cnci.nbClient, cnci.sbClient, cnci.watchFactory)
-	}
 
 	addressSetFactory := addressset.NewOvnAddressSetFactory(cnci.nbClient, ipv4Mode, ipv6Mode)
-
-	var svcController *svccontroller.Controller
-	if util.IsNetworkSegmentationSupportEnabled() && netInfo.IsPrimaryNetwork() {
-		var err error
-		svcController, err = svccontroller.NewController(
-			cnci.client, cnci.nbClient,
-			cnci.watchFactory.ServiceCoreInformer(),
-			cnci.watchFactory.EndpointSliceCoreInformer(),
-			cnci.watchFactory.NodeCoreInformer(),
-			networkManager,
-			cnci.recorder,
-			netInfo,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("unable to create new service controller for network=%s: %w", netInfo.GetNetworkName(), err)
-		}
-	}
 
 	oc := &SecondaryLayer3NetworkController{
 		BaseSecondaryNetworkController: BaseSecondaryNetworkController{
@@ -361,7 +340,6 @@ func NewSecondaryLayer3NetworkController(
 				stopChan:                    stopChan,
 				wg:                          &sync.WaitGroup{},
 				localZoneNodes:              &sync.Map{},
-				zoneICHandler:               zoneICHandler,
 				cancelableCtx:               util.NewCancelableContext(),
 				networkManager:              networkManager,
 			},
@@ -373,13 +351,32 @@ func NewSecondaryLayer3NetworkController(
 		gatewaysFailed:              sync.Map{},
 		gatewayTopologyFactory:      topology.NewGatewayTopologyFactory(cnci.nbClient),
 		gatewayManagers:             sync.Map{},
-		svcController:               svcController,
 		eIPController:               eIPController,
+	}
+
+	if config.OVNKubernetesFeature.EnableInterconnect {
+		oc.zoneICHandler = zoneic.NewZoneInterconnectHandler(oc.GetNetInfo(), cnci.nbClient, cnci.sbClient, cnci.watchFactory)
+	}
+
+	if util.IsNetworkSegmentationSupportEnabled() && netInfo.IsPrimaryNetwork() {
+		var err error
+		oc.svcController, err = svccontroller.NewController(
+			cnci.client, cnci.nbClient,
+			cnci.watchFactory.ServiceCoreInformer(),
+			cnci.watchFactory.EndpointSliceCoreInformer(),
+			cnci.watchFactory.NodeCoreInformer(),
+			networkManager,
+			cnci.recorder,
+			oc.GetNetInfo(),
+		)
+		if err != nil {
+			return nil, fmt.Errorf("unable to create new service controller for network=%s: %w", netInfo.GetNetworkName(), err)
+		}
 	}
 
 	if oc.allocatesPodAnnotation() {
 		podAnnotationAllocator := pod.NewPodAnnotationAllocator(
-			netInfo,
+			oc.GetNetInfo(),
 			cnci.watchFactory.PodCoreInformer().Lister(),
 			cnci.kube,
 			nil)
@@ -587,6 +584,38 @@ func (oc *SecondaryLayer3NetworkController) Run() error {
 	return nil
 }
 
+func (oc *SecondaryLayer3NetworkController) Reconcile(netInfo util.NetInfo) error {
+	var err error
+	var retryNodes []*kapi.Node
+	var retryNodeNames []string
+	oc.localZoneNodes.Range(func(key, value any) bool {
+		nodeName := key.(string)
+		wasAdvertised := util.IsPodNetworkAdvertisedAtNode(oc, nodeName)
+		isAdvertised := util.IsPodNetworkAdvertisedAtNode(netInfo, nodeName)
+		if wasAdvertised == isAdvertised {
+			// noop
+			return true
+		}
+		var node *kapi.Node
+		node, err = oc.watchFactory.GetNode(nodeName)
+		if err != nil {
+			return false
+		}
+		retryNodes = append(retryNodes, node)
+		retryNodeNames = append(retryNodeNames, node.Name)
+		return true
+	})
+	if err != nil {
+		return fmt.Errorf("failed to reconcile network %s: %w", oc.GetNetworkName(), err)
+	}
+
+	for _, node := range retryNodes {
+		oc.addNodeFailed.Store(node.Name, true)
+	}
+
+	return oc.BaseNetworkController.reconcile(netInfo, retryNodes)
+}
+
 // WatchNodes starts the watching of node resource and calls
 // back the appropriate handler logic
 func (oc *SecondaryLayer3NetworkController) WatchNodes() error {
@@ -764,11 +793,11 @@ func (oc *SecondaryLayer3NetworkController) addUpdateLocalNodeEvent(node *kapi.N
 	}
 
 	if config.OVNKubernetesFeature.EnableEgressIP && util.IsNetworkSegmentationSupportEnabled() && oc.IsPrimaryNetwork() {
-		if err = oc.eIPController.ensureL3ClusterRouterPoliciesForNetwork(oc.GetNetInfo()); err != nil {
-			errs = append(errs, fmt.Errorf("failed to add network %s to EgressIP controller: %v", oc.GetNetworkName(), err))
+		if err = oc.eIPController.ensureRouterPoliciesForNetwork(oc.GetNetInfo()); err != nil {
+			errs = append(errs, fmt.Errorf("failed to ensure EgressIP router polices for network %s: %v", oc.GetNetworkName(), err))
 		}
-		if err = oc.eIPController.ensureL3SwitchPoliciesForNode(oc.GetNetInfo(), node.Name); err != nil {
-			errs = append(errs, fmt.Errorf("failed to ensure EgressIP switch policies: %v", err))
+		if err = oc.eIPController.ensureSwitchPoliciesForNode(oc.GetNetInfo(), node.Name); err != nil {
+			errs = append(errs, fmt.Errorf("failed to ensure EgressIP switch policies for network %s: %v", oc.GetNetworkName(), err))
 		}
 	}
 
@@ -830,6 +859,28 @@ func (oc *SecondaryLayer3NetworkController) addUDNNodeSubnetEgressSNAT(localPodS
 	return nil
 }
 
+// deleteUDNNodeSubnetEgressSNAT deletes SNAT rule from network specific
+// ovn_cluster_router depending on whether the network is advertised or not
+func (oc *SecondaryLayer3NetworkController) deleteUDNNodeSubnetEgressSNAT(localPodSubnets []*net.IPNet, node *kapi.Node) error {
+	outputPort := types.RouterToSwitchPrefix + oc.GetNetworkScopedName(node.Name)
+	nats, err := oc.buildUDNEgressSNAT(localPodSubnets, outputPort, node)
+	if err != nil {
+		return fmt.Errorf("failed to build UDN masquerade SNATs for network %q on node %q, err: %w",
+			oc.GetNetworkName(), node.Name, err)
+	}
+	if len(nats) == 0 {
+		return nil // nothing to do
+	}
+	router := &nbdb.LogicalRouter{
+		Name: oc.GetNetworkScopedClusterRouterName(),
+	}
+	if err := libovsdbops.DeleteNATs(oc.nbClient, router, nats...); err != nil {
+		return fmt.Errorf("failed to delete SNAT for node subnet on router: %q for network %q, error: %w",
+			oc.GetNetworkScopedClusterRouterName(), oc.GetNetworkName(), err)
+	}
+	return nil
+}
+
 func (oc *SecondaryLayer3NetworkController) addNode(node *kapi.Node) ([]*net.IPNet, error) {
 	// Node subnet for the secondary layer3 network is allocated by cluster manager.
 	// Make sure that the node is allocated with the subnet before proceeding
@@ -843,8 +894,12 @@ func (oc *SecondaryLayer3NetworkController) addNode(node *kapi.Node) ([]*net.IPN
 	if err != nil {
 		return nil, err
 	}
-	if util.IsNetworkSegmentationSupportEnabled() && oc.IsPrimaryNetwork() {
+	if util.IsNetworkSegmentationSupportEnabled() && oc.IsPrimaryNetwork() && !util.IsPodNetworkAdvertisedAtNode(oc, node.Name) {
 		if err := oc.addUDNNodeSubnetEgressSNAT(hostSubnets, node); err != nil {
+			return nil, err
+		}
+	} else if util.IsPodNetworkAdvertisedAtNode(oc, node.Name) {
+		if err := oc.deleteUDNNodeSubnetEgressSNAT(hostSubnets, node); err != nil {
 			return nil, err
 		}
 	}
@@ -1075,16 +1130,12 @@ func (oc *SecondaryLayer3NetworkController) gatewayManagerForNode(nodeName strin
 }
 
 func (oc *SecondaryLayer3NetworkController) StartServiceController(wg *sync.WaitGroup, runRepair bool) error {
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		useLBGroups := oc.clusterLoadBalancerGroupUUID != ""
-		// use 5 workers like most of the kubernetes controllers in the kubernetes controller-manager
-		// do not use LB templates for UDNs - OVN bug https://issues.redhat.com/browse/FDP-988
-		err := oc.svcController.Run(5, oc.stopChan, runRepair, useLBGroups, false)
-		if err != nil {
-			klog.Errorf("Error running OVN Kubernetes Services controller for network %s: %v", oc.GetNetworkName(), err)
-		}
-	}()
+	useLBGroups := oc.clusterLoadBalancerGroupUUID != ""
+	// use 5 workers like most of the kubernetes controllers in the kubernetes controller-manager
+	// do not use LB templates for UDNs - OVN bug https://issues.redhat.com/browse/FDP-988
+	err := oc.svcController.Run(5, oc.stopChan, wg, runRepair, useLBGroups, false)
+	if err != nil {
+		return fmt.Errorf("error running OVN Kubernetes Services controller for network %s: %v", oc.GetNetworkName(), err)
+	}
 	return nil
 }

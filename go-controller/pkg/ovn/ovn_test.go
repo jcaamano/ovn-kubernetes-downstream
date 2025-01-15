@@ -378,7 +378,7 @@ func NewOvnController(
 		return nil, err
 	}
 
-	dnc, err := newDefaultNetworkControllerCommon(cnci, stopChan, wg, addressSetFactory, networkManager, nil, eIPController, portCache)
+	dnc, err := newDefaultNetworkControllerCommon(cnci, stopChan, wg, addressSetFactory, networkManager, nil, nil, eIPController, portCache)
 	gomega.Expect(err).NotTo(gomega.HaveOccurred())
 
 	if nbZoneFailed {
@@ -504,7 +504,7 @@ func (o *FakeOVN) NewSecondaryNetworkController(netattachdef *nettypes.NetworkAt
 			}
 			secondaryController = &l3Controller.BaseSecondaryNetworkController
 		case types.Layer2Topology:
-			l2Controller, err := NewSecondaryLayer2NetworkController(cnci, nInfo, o.networkManager.Interface())
+			l2Controller, err := NewSecondaryLayer2NetworkController(cnci, nInfo, o.networkManager.Interface(), o.eIPController, o.portCache)
 			gomega.Expect(err).NotTo(gomega.HaveOccurred())
 			if o.asf != nil { // use fake asf only when enabled
 				l2Controller.addressSetFactory = asf
@@ -539,7 +539,7 @@ func (o *FakeOVN) NewSecondaryNetworkController(netattachdef *nettypes.NetworkAt
 	return nil
 }
 
-func (o *FakeOVN) patchEgressIPObj(nodeName, egressIPName, egressIP, network string) {
+func (o *FakeOVN) patchEgressIPObj(nodeName, egressIPName, egressIP string) {
 	// NOTE: Cluster manager is the one who patches the egressIP object.
 	// For the sake of unit testing egressip zone controller we need to patch egressIP object manually
 	// There are tests in cluster-manager package covering the patch logic.

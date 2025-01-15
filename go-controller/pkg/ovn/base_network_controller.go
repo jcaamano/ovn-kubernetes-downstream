@@ -24,6 +24,7 @@ import (
 	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/observability"
 	addressset "github.com/ovn-org/ovn-kubernetes/go-controller/pkg/ovn/address_set"
 	lsm "github.com/ovn-org/ovn-kubernetes/go-controller/pkg/ovn/logical_switch_manager"
+	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/ovn/routeimport"
 	zoneic "github.com/ovn-org/ovn-kubernetes/go-controller/pkg/ovn/zone_interconnect"
 	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/persistentips"
 	ovnretry "github.com/ovn-org/ovn-kubernetes/go-controller/pkg/retry"
@@ -177,6 +178,36 @@ type BaseNetworkController struct {
 	ovnClusterLRPToJoinIfAddrs []*net.IPNet
 
 	observManager *observability.Manager
+
+	routeImportManager routeimport.Manager
+}
+
+func (oc *BaseNetworkController) reconcile(netInfo util.NetInfo, retryNodes []*kapi.Node) error {
+	reconcileRoutes := oc.routeImportManager != nil && oc.routeImportManager.NeedsReconciliation(netInfo)
+
+	err := util.ReconcileNetInfo(oc.ReconcilableNetInfo, netInfo)
+	if err != nil {
+		klog.Errorf("Failed to reconcile network %s: %v", oc.GetNetworkName(), err)
+	}
+
+	if reconcileRoutes {
+		err = oc.routeImportManager.ReconcileNetwork(oc.GetNetworkName())
+		if err != nil {
+			return err
+		}
+	}
+
+	for _, node := range retryNodes {
+		err = oc.retryNodes.AddRetryObjWithAddNoBackoff(node)
+		if err != nil {
+			klog.Errorf("Failed to retry node %s for network %s: %v", node.Name, oc.GetNetworkName(), err)
+		}
+	}
+	if len(retryNodes) > 0 {
+		oc.retryNodes.RequestRetryObjs()
+	}
+
+	return nil
 }
 
 // BaseSecondaryNetworkController structure holds per-network fields and network specific
@@ -190,10 +221,6 @@ type BaseSecondaryNetworkController struct {
 	netPolicyHandler *factory.Handler
 	// multi-network policy events factory handler
 	multiNetPolicyHandler *factory.Handler
-}
-
-func (oc *BaseSecondaryNetworkController) Reconcile(netInfo util.NetInfo) error {
-	return util.ReconcileNetInfo(oc.ReconcilableNetInfo, netInfo)
 }
 
 func getNetworkControllerName(netName string) string {
