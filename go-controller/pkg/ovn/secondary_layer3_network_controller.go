@@ -585,35 +585,10 @@ func (oc *SecondaryLayer3NetworkController) Run() error {
 }
 
 func (oc *SecondaryLayer3NetworkController) Reconcile(netInfo util.NetInfo) error {
-	var err error
-	var retryNodes []*kapi.Node
-	var retryNodeNames []string
-	oc.localZoneNodes.Range(func(key, value any) bool {
-		nodeName := key.(string)
-		wasAdvertised := util.IsPodNetworkAdvertisedAtNode(oc, nodeName)
-		isAdvertised := util.IsPodNetworkAdvertisedAtNode(netInfo, nodeName)
-		if wasAdvertised == isAdvertised {
-			// noop
-			return true
-		}
-		var node *kapi.Node
-		node, err = oc.watchFactory.GetNode(nodeName)
-		if err != nil {
-			return false
-		}
-		retryNodes = append(retryNodes, node)
-		retryNodeNames = append(retryNodeNames, node.Name)
-		return true
-	})
-	if err != nil {
-		return fmt.Errorf("failed to reconcile network %s: %w", oc.GetNetworkName(), err)
-	}
-
-	for _, node := range retryNodes {
-		oc.addNodeFailed.Store(node.Name, true)
-	}
-
-	return oc.BaseNetworkController.reconcile(netInfo, retryNodes)
+	return oc.BaseNetworkController.reconcile(
+		netInfo,
+		func(node string) { oc.addNodeFailed.Store(node, true) },
+	)
 }
 
 // WatchNodes starts the watching of node resource and calls

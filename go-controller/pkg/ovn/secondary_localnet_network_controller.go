@@ -309,6 +309,10 @@ func (oc *SecondaryLocalnetNetworkController) Stop() {
 }
 
 func (oc *SecondaryLocalnetNetworkController) Reconcile(netInfo util.NetInfo) error {
+	err := util.ReconcileNetInfo(oc.ReconcilableNetInfo, netInfo)
+	if err != nil {
+		klog.Errorf("Failed to reconcile network information for network %s: %v", oc.GetNetworkName(), err)
+	}
 	return nil
 }
 

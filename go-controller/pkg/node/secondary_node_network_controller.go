@@ -137,16 +137,12 @@ func (oc *SecondaryNodeNetworkController) Reconcile(netInfo util.NetInfo) error 
 
 	err := util.ReconcileNetInfo(oc.ReconcilableNetInfo, netInfo)
 	if err != nil {
-		klog.Errorf("Failed to reconcile network %s: %v", oc.GetNetworkName(), err)
+		klog.Errorf("Failed to reconcile network information for network %s: %v", oc.GetNetworkName(), err)
 	}
 
 	if reconcilePodNetwork {
-		isUDNNetworkAdvertisedAtNode := oc.isUDNNetworkAdvertisedAtNode()
-		if oc.gateway != nil {
-			oc.gateway.SetUDNNetworkAdvertised(oc.GetNetworkName(), isUDNNetworkAdvertisedAtNode)
-			if err := oc.gateway.Reconcile(); err != nil {
-				return err
-			}
+		if err := oc.gateway.Reconcile(); err != nil {
+			klog.Errorf("Failed to reconcile gateway for network %s: %v", oc.GetNetworkName(), err)
 		}
 	}
 

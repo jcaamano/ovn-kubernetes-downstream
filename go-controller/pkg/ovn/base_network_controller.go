@@ -182,22 +182,46 @@ type BaseNetworkController struct {
 	routeImportManager routeimport.Manager
 }
 
-func (oc *BaseNetworkController) reconcile(netInfo util.NetInfo, retryNodes []*kapi.Node) error {
+func (oc *BaseNetworkController) reconcile(netInfo util.NetInfo, setNodeFailed func(string)) error {
+	// gather some information first
+	var err error
+	var retryNodes []*kapi.Node
+	oc.localZoneNodes.Range(func(key, value any) bool {
+		nodeName := key.(string)
+		wasAdvertised := util.IsPodNetworkAdvertisedAtNode(oc, nodeName)
+		isAdvertised := util.IsPodNetworkAdvertisedAtNode(netInfo, nodeName)
+		if wasAdvertised == isAdvertised {
+			// noop
+			return true
+		}
+		var node *kapi.Node
+		node, err = oc.watchFactory.GetNode(nodeName)
+		if err != nil {
+			return false
+		}
+		retryNodes = append(retryNodes, node)
+		return true
+	})
+	if err != nil {
+		return fmt.Errorf("failed to reconcile network %s: %w", oc.GetNetworkName(), err)
+	}
 	reconcileRoutes := oc.routeImportManager != nil && oc.routeImportManager.NeedsReconciliation(netInfo)
 
-	err := util.ReconcileNetInfo(oc.ReconcilableNetInfo, netInfo)
+	// set the new NetInfo, point of no return
+	err = util.ReconcileNetInfo(oc.ReconcilableNetInfo, netInfo)
 	if err != nil {
-		klog.Errorf("Failed to reconcile network %s: %v", oc.GetNetworkName(), err)
+		klog.Errorf("Failed to reconcile network information for network %s: %v", oc.GetNetworkName(), err)
 	}
 
 	if reconcileRoutes {
 		err = oc.routeImportManager.ReconcileNetwork(oc.GetNetworkName())
 		if err != nil {
-			return err
+			klog.Errorf("Failed to reconcile network %s on route import controller: %v", oc.GetNetworkName(), err)
 		}
 	}
 
 	for _, node := range retryNodes {
+		setNodeFailed(node.Name)
 		err = oc.retryNodes.AddRetryObjWithAddNoBackoff(node)
 		if err != nil {
 			klog.Errorf("Failed to retry node %s for network %s: %v", node.Name, oc.GetNetworkName(), err)

@@ -1359,9 +1359,9 @@ func TestConstructUDNVRFIPRulesPodNetworkAdvertised(t *testing.T) {
 			netInfo, err := util.ParseNADInfo(nad)
 			g.Expect(err).NotTo(HaveOccurred())
 			mutableNetInfo := util.NewMutableNetInfo(netInfo)
+			mutableNetInfo.SetPodNetworkAdvertisedVRFs(map[string][]string{node.Name: {"whatever-vrf"}})
 			udnGateway, err := NewUserDefinedNetworkGateway(mutableNetInfo, 3, node, nil, nil, nil, nil, &gateway{})
 			g.Expect(err).NotTo(HaveOccurred())
-			udnGateway.SetUDNNetworkAdvertised("bluenet", true)
 			rules, err := udnGateway.constructUDNVRFIPRules(test.vrftableID)
 			g.Expect(err).To(BeNil())
 			for i, rule := range rules {

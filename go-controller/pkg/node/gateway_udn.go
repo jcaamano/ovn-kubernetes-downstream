@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"sync"
+	"sync/atomic"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
@@ -78,23 +78,18 @@ type UserDefinedNetworkGateway struct {
 	// iprules manager that creates and manages iprules for
 	// all UDNs. Must be accessed with a lock
 	ruleManager *iprulemanager.Controller
-
-	// isUDNNetworkAdvertised is a place holder to indicate whether the
-	// network is advertised or not
-	isUDNNetworkAdvertised     bool
-	isUDNNetworkAdvertisedLock sync.Mutex
 }
 
 // UTILS Needed for UDN (also leveraged for default netInfo) in bridgeConfiguration
 
 // getBridgePortConfigurations returns a slice of Network port configurations along with the
 // uplinkName and physical port's ofport value
-func (b *bridgeConfiguration) getBridgePortConfigurations() ([]bridgeUDNConfiguration, string, string) {
+func (b *bridgeConfiguration) getBridgePortConfigurations() ([]*bridgeUDNConfiguration, string, string) {
 	b.Lock()
 	defer b.Unlock()
-	netConfigs := make([]bridgeUDNConfiguration, len(b.netConfig))
+	netConfigs := make([]*bridgeUDNConfiguration, len(b.netConfig))
 	for _, netConfig := range b.netConfig {
-		netConfigs = append(netConfigs, *netConfig)
+		netConfigs = append(netConfigs, netConfig.shallowCopy())
 	}
 	return netConfigs, b.uplinkName, b.ofPortPhys
 }
@@ -121,14 +116,15 @@ func (b *bridgeConfiguration) addNetworkBridgeConfig(nInfo util.NetInfo,
 	_, found := b.netConfig[netName]
 	if !found {
 		netConfig := &bridgeUDNConfiguration{
-			patchPort:  patchPort,
-			masqCTMark: fmt.Sprintf("0x%x", masqCTMark),
-			pktMark:    fmt.Sprintf("0x%x", pktMark),
-			v4MasqIPs:  v4MasqIPs,
-			v6MasqIPs:  v6MasqIPs,
-			subnets:    nInfo.Subnets(),
-			nodeSubnet: nodeSubnets,
+			patchPort:   patchPort,
+			masqCTMark:  fmt.Sprintf("0x%x", masqCTMark),
+			pktMark:     fmt.Sprintf("0x%x", pktMark),
+			v4MasqIPs:   v4MasqIPs,
+			v6MasqIPs:   v6MasqIPs,
+			subnets:     nInfo.Subnets(),
+			nodeSubnets: nodeSubnets,
 		}
+		netConfig.advertised.Store(util.IsPodNetworkAdvertisedAtNode(nInfo, b.nodeName))
 
 		b.netConfig[netName] = netConfig
 	} else {
@@ -146,7 +142,7 @@ func (b *bridgeConfiguration) delNetworkBridgeConfig(nInfo util.NetInfo) {
 	delete(b.netConfig, nInfo.GetNetworkName())
 }
 
-// getActiveNetworkBridgeConfig returns a copy of the network configuration corresponding to the
+// getActiveNetworkBridgeConfig returns a shallow copy of the network configuration corresponding to the
 // provided netInfo.
 //
 // NOTE: if the network configuration can't be found or if the network is not patched by OVN
@@ -156,8 +152,7 @@ func (b *bridgeConfiguration) getActiveNetworkBridgeConfig(networkName string) *
 	defer b.Unlock()
 
 	if netConfig, found := b.netConfig[networkName]; found && netConfig.ofPortPatch != "" {
-		result := *netConfig
-		return &result
+		return netConfig.shallowCopy()
 	}
 	return nil
 }
@@ -178,15 +173,30 @@ func (b *bridgeConfiguration) patchedNetConfigs() []*bridgeUDNConfiguration {
 // bridgeUDNConfiguration holds the patchport and ctMark
 // information for a given network
 type bridgeUDNConfiguration struct {
-	patchPort              string
-	ofPortPatch            string
-	masqCTMark             string
-	pktMark                string
-	v4MasqIPs              *udn.MasqueradeIPs
-	v6MasqIPs              *udn.MasqueradeIPs
-	subnets                []config.CIDRNetworkEntry
-	nodeSubnet             []*net.IPNet
-	isUDNNetworkAdvertised bool
+	patchPort   string
+	ofPortPatch string
+	masqCTMark  string
+	pktMark     string
+	v4MasqIPs   *udn.MasqueradeIPs
+	v6MasqIPs   *udn.MasqueradeIPs
+	subnets     []config.CIDRNetworkEntry
+	nodeSubnets []*net.IPNet
+	advertised  atomic.Bool
+}
+
+func (netConfig *bridgeUDNConfiguration) shallowCopy() *bridgeUDNConfiguration {
+	copy := &bridgeUDNConfiguration{
+		patchPort:   netConfig.patchPort,
+		ofPortPatch: netConfig.ofPortPatch,
+		masqCTMark:  netConfig.masqCTMark,
+		pktMark:     netConfig.pktMark,
+		v4MasqIPs:   netConfig.v4MasqIPs,
+		v6MasqIPs:   netConfig.v6MasqIPs,
+		subnets:     netConfig.subnets,
+		nodeSubnets: netConfig.nodeSubnets,
+	}
+	copy.advertised.Store(netConfig.advertised.Load())
+	return copy
 }
 
 func (netConfig *bridgeUDNConfiguration) isDefaultNetwork() bool {
@@ -680,18 +690,22 @@ func (udng *UserDefinedNetworkGateway) getV6MasqueradeIP() (*net.IPNet, error) {
 
 // constructUDNVRFIPRules constructs rules that redirect matching packets
 // into the corresponding UDN VRF routing table.
-// Example:
+// If the network is not advertised, an example of the rules we set for a
+// network is:
 // 2000:   from all fwmark 0x1001 lookup 1007
 // 2000:   from all to 169.254.0.12 lookup 1007
 // 2000:   from all fwmark 0x1002 lookup 1009
 // 2000:   from all to 169.254.0.14 lookup 1009
-// If isPodNetworkAdvertised is set to true then we update IP rules as below
-// for 10.132.0.0/14 UDN subnet
+// If the network is advertised, an example of the rules we set for a network
+// is:
+// 2000:	from all fwmark 0x1001 lookup 1007
+// 2000:	from all to 10.132.0.0/14 lookup 1007
 // 2000:	from all fwmark 0x1001 lookup 1009
-// 2000:	from all to 10.132.0.0/14 lookup 1009
+// 2000:	from all to 10.134.0.0/14 lookup 1009
 func (udng *UserDefinedNetworkGateway) constructUDNVRFIPRules(vrfTableId int) ([]netlink.Rule, error) {
 	var ipRules []netlink.Rule
-	if udng.isUDNNetworkAdvertised {
+	isNetworkAdvertised := util.IsPodNetworkAdvertisedAtNode(udng.NetInfo, udng.node.Name)
+	if isNetworkAdvertised {
 		dstIPs := udng.Subnets()
 		for _, dstIP := range dstIPs {
 			ipRules = append(ipRules, generateIPRuleForPacketMark(udng.pktMark, utilnet.IsIPv6CIDR(dstIP.CIDR), uint(vrfTableId)))
@@ -768,23 +782,13 @@ func addRPFilterLooseModeForManagementPort(mgmtPortName string) error {
 	return nil
 }
 
-func (udng *UserDefinedNetworkGateway) SetUDNNetworkAdvertised(networkName string, isUDNNetworkAdvertised bool) {
-	udng.isUDNNetworkAdvertisedLock.Lock()
-	defer udng.isUDNNetworkAdvertisedLock.Unlock()
-	udng.isUDNNetworkAdvertised = isUDNNetworkAdvertised
-	if udng.openflowManager != nil {
-		for netName, netConfig := range udng.openflowManager.defaultBridge.netConfig {
-			if netName == networkName {
-				netConfig.isUDNNetworkAdvertised = isUDNNetworkAdvertised
-			} else if netName == types.DefaultNetworkName {
-				netConfig.isUDNNetworkAdvertised = udng.isPodNetworkAdvertised
-			}
-		}
-	}
-}
-
 func (udng *UserDefinedNetworkGateway) Reconcile() error {
 	klog.Info("Reconciling UDN gateway with updates")
+
+	// update bridge configuration
+	isNetworkAdvertised := util.IsPodNetworkAdvertisedAtNode(udng.NetInfo, udng.node.Name)
+	udng.openflowManager.defaultBridge.netConfig[udng.GetNetworkName()].advertised.Store(isNetworkAdvertised)
+
 	if err := udng.updateUDNVRFIPRule(); err != nil {
 		return fmt.Errorf("error while updating ip rule for UDN %s: %s", udng.GetNetworkName(), err)
 	}
@@ -833,16 +837,7 @@ func (udng *UserDefinedNetworkGateway) updateUDNVRFIPRule() error {
 // table=1, n_packets=0, n_bytes=0, priority=16,ip,nw_dst=128.192.0.2 actions=LOCAL (Both gateway modes)
 // table=1, n_packets=0, n_bytes=0, priority=15,ip,nw_dst=128.192.0.0/14 actions=output:3 (shared gateway mode)
 func (udng *UserDefinedNetworkGateway) updateUDNFlow() error {
-	node, err := udng.watchFactory.GetNode(udng.nodeIPManager.nodeName)
-	if err != nil {
-		return fmt.Errorf("unable to get node %s: %s", udng.nodeIPManager.nodeName, err)
-	}
-	subnets, err := util.ParseNodeHostSubnetAnnotation(node, types.DefaultNetworkName)
-	if err != nil {
-		return fmt.Errorf("failed to get subnets for node: %s for OpenFlow cache update; err: %w", node.Name, err)
-	}
-	if err := udng.openflowManager.updateBridgeFlowCache(subnets, udng.nodeIPManager.ListAddresses(),
-		udng.isPodNetworkAdvertised, udng.isUDNNetworkAdvertised); err != nil {
+	if err := udng.openflowManager.updateBridgeFlowCache(udng.nodeIPManager.ListAddresses()); err != nil {
 		return err
 	}
 	return nil
